@@ -1,133 +1,255 @@
-﻿using Microsoft.WindowsAzure.Storage.Blob;
-using System;
+﻿using System;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Threading;
 
-
 namespace Lucene.Net.Store.Azure
 {
+    using System.Collections.Generic;
+    using System.Globalization;
+    using System.Net.Http;
+
     /// <summary>
     /// Implements IndexOutput semantics for a write/append only file
     /// </summary>
     public class AzureIndexOutput : IndexOutput
     {
-        private AzureDirectory _azureDirectory;
-        private CloudBlobContainer _blobContainer;
-        private string _name;
-        private IndexOutput _indexOutput;
-        private Mutex _fileMutex;
-        private ICloudBlob _blob;
-        public Lucene.Net.Store.Directory CacheDirectory { get { return _azureDirectory.CacheDirectory; } }
+        /// <summary>
+        /// The azure directory.
+        /// </summary>
+        private readonly AzureDirectory azureDirectory;
 
-        public AzureIndexOutput(AzureDirectory azureDirectory, ICloudBlob blob)
+        /// <summary>
+        /// The _blob.
+        /// </summary>
+        private readonly string blob;
+
+        /// <summary>
+        /// The _file mutex.
+        /// </summary>
+        private readonly Mutex fileMutex;
+
+        /// <summary>
+        /// The index output.
+        /// </summary>
+        private IndexOutput indexOutput;
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="AzureIndexOutput"/> class.
+        /// </summary>
+        /// <param name="azureDirectory">The azure directory.</param>
+        /// <param name="blob">The blob.</param>
+        public AzureIndexOutput(AzureDirectory azureDirectory, string blob)
         {
-            _fileMutex = BlobMutexManager.GrabMutex(_name); 
-            _fileMutex.WaitOne();
+            this.fileMutex = BlobMutexManager.GrabMutex(blob); 
+            this.fileMutex.WaitOne();
+
             try
             {
-                _azureDirectory = azureDirectory;
-                _blobContainer = _azureDirectory.BlobContainer;
-                _blob = blob;
-                _name = blob.Uri.Segments[blob.Uri.Segments.Length - 1];
+                this.azureDirectory = azureDirectory;
+                this.blob = blob;
 
                 // create the local cache one we will operate against...
-                _indexOutput = CacheDirectory.CreateOutput(_name);
+                this.indexOutput = this.azureDirectory.CacheDirectory.CreateOutput(blob);
             }
             finally
             {
-                _fileMutex.ReleaseMutex();
+                this.fileMutex.ReleaseMutex();
             }
         }
 
-        public override void Flush()
+        /// <summary>
+        /// Gets the cache directory.
+        /// </summary>
+        public Lucene.Net.Store.Directory CacheDirectory
         {
-            _indexOutput.Flush();
+            get { return this.azureDirectory.CacheDirectory; }
         }
 
+        /// <summary>
+        /// Gets the length.
+        /// </summary>
+        public override long Length
+        {
+            get
+            {
+                return this.indexOutput.Length;
+            }
+        }
+
+        /// <summary>
+        /// Gets the file pointer.
+        /// </summary>
+        public override long FilePointer
+        {
+            get
+            {
+                return this.indexOutput.FilePointer;
+            }
+        }
+
+        /// <summary>
+        /// The flush.
+        /// </summary>
+        public override void Flush()
+        {
+            this.indexOutput.Flush();
+        }
+
+        /// <summary>
+        /// Write a byte.
+        /// </summary>
+        /// <param name="b">The byte.</param>
+        public override void WriteByte(byte b)
+        {
+            this.indexOutput.WriteByte(b);
+        }
+
+        /// <summary>
+        /// Write bytes.
+        /// </summary>
+        /// <param name="b">The bytes.</param>
+        /// <param name="length">The length.</param>
+        public override void WriteBytes(byte[] b, int length)
+        {
+            this.indexOutput.WriteBytes(b, length);
+        }
+
+        /// <summary>
+        /// Write bytes.
+        /// </summary>
+        /// <param name="b">The bytes.</param>
+        /// <param name="offset">The offset.</param>
+        /// <param name="length">The length.</param>
+        public override void WriteBytes(byte[] b, int offset, int length)
+        {
+            this.indexOutput.WriteBytes(b, offset, length);
+        }
+
+        /// <summary>
+        /// Seek in the index output.
+        /// </summary>
+        /// <param name="pos">The position.</param>
+        public override void Seek(long pos)
+        {
+            this.indexOutput.Seek(pos);
+        }
+
+        /// <summary>
+        /// Dispose the index output.
+        /// </summary>
+        /// <param name="disposing">The disposing.</param>
         protected override void Dispose(bool disposing)
         {
-            _fileMutex.WaitOne();
+            this.fileMutex.WaitOne();
             try
             {
-                string fileName = _name;
-
                 // make sure it's all written out
-                _indexOutput.Flush();
+                this.indexOutput.Flush();
 
-                long originalLength = _indexOutput.Length;
-                _indexOutput.Dispose();
+                var originalLength = this.indexOutput.Length;
+                this.indexOutput.Dispose();
 
                 Stream blobStream;
 
                 // optionally put a compressor around the blob stream
-                if (_azureDirectory.ShouldCompressFile(_name))
+                if (this.azureDirectory.ShouldCompressFile(this.blob))
                 {
-                    blobStream = CompressStream(fileName, originalLength);
+                    blobStream = this.CompressStream(this.blob, originalLength);
                 }
                 else
                 {
-                    blobStream = new StreamInput(CacheDirectory.OpenInput(fileName));
+                    blobStream = new StreamInput(this.azureDirectory.CacheDirectory.OpenInput(this.blob));
                 }
 
                 try
                 {
                     // push the blobStream up to the cloud
-                    _blob.UploadFromStream(blobStream);
+                    StorageRestClient.Run(
+                        HttpMethod.Put,
+                        string.Format(CultureInfo.InvariantCulture, "{0}/{1}", this.azureDirectory.ContainerName, this.blob),
+                        null,
+                        Tuple.Create(string.Empty, blobStream),
+                        response =>
+                        {
+                            if (!response.IsSuccessStatusCode)
+                            {
+                                throw new Exception("Failed to upload blob.");
+                            }
+                        }).Wait();
 
                     // set the metadata with the original index file properties
-                    _blob.Metadata["CachedLength"] = originalLength.ToString();
-                    _blob.Metadata["CachedLastModified"] = CacheDirectory.FileModified(fileName).ToString();
-                    _blob.SetMetadata();
+                    StorageRestClient.Run(
+                        HttpMethod.Put,
+                        string.Format(CultureInfo.InvariantCulture, "{0}/{1}?comp=metadata", this.azureDirectory.ContainerName, this.blob),
+                        new Dictionary<string, string>
+                        {
+                            { StorageRestClient.MetadataHeaderTemplate + "CachedLength", originalLength.ToString(CultureInfo.InvariantCulture) },
+                            { StorageRestClient.MetadataHeaderTemplate + "CachedLastModified", this.azureDirectory.CacheDirectory.FileModified(this.blob).ToString(CultureInfo.InvariantCulture) }
+                        }, 
+                        null,
+                        response =>
+                        {
+                            if (!response.IsSuccessStatusCode)
+                            {
+                                throw new Exception("Failed to update blob metadata.");
+                            }
+                        }).Wait();
 
-                    Debug.WriteLine(string.Format("PUT {1} bytes to {0} in cloud", _name, blobStream.Length));
+                    Debug.WriteLine("PUT {1} bytes to {0} in cloud", this.blob, blobStream.Length);
                 }
                 finally
                 {
                     blobStream.Dispose();
                 }
 
-#if FULLDEBUG
-                Debug.WriteLine(string.Format("CLOSED WRITESTREAM {0}", _name));
-#endif
+                Debug.WriteLine(string.Format("CLOSED WRITESTREAM {0}", this.blob));
+
                 // clean up
-                _indexOutput = null;
-                _blobContainer = null;
-                _blob = null;
+                this.indexOutput = null;
                 GC.SuppressFinalize(this);
             }
             finally
             {
-                _fileMutex.ReleaseMutex();
+                this.fileMutex.ReleaseMutex();
             }
         }
 
+        /// <summary>
+        /// Compress the stream.
+        /// </summary>
+        /// <param name="fileName">The file name.</param>
+        /// <param name="originalLength">The original length.</param>
+        /// <returns>
+        /// The <see cref="MemoryStream"/>.
+        /// </returns>
         private MemoryStream CompressStream(string fileName, long originalLength)
         {
             // unfortunately, deflate stream doesn't allow seek, and we need a seekable stream
             // to pass to the blob storage stuff, so we compress into a memory stream
-            MemoryStream compressedStream = new MemoryStream();
+            var compressedStream = new MemoryStream();
 
             try
             {
-                using (var indexInput = CacheDirectory.OpenInput(fileName))
+                using (var indexInput = this.azureDirectory.CacheDirectory.OpenInput(fileName))
                 using (var compressor = new DeflateStream(compressedStream, CompressionMode.Compress, true))
                 {
                     // compress to compressedOutputStream
-                    byte[] bytes = new byte[indexInput.Length()];
-                    indexInput.ReadBytes(bytes, 0, (int)bytes.Length);
-                    compressor.Write(bytes, 0, (int)bytes.Length);
+                    var bytes = new byte[indexInput.Length()];
+                    indexInput.ReadBytes(bytes, 0, bytes.Length);
+                    compressor.Write(bytes, 0, bytes.Length);
                 }
 
                 // seek back to beginning of comrpessed stream
                 compressedStream.Seek(0, SeekOrigin.Begin);
 
-                Debug.WriteLine(string.Format("COMPRESSED {0} -> {1} {2}% to {3}",
+                Debug.WriteLine(
+                    "COMPRESSED {0} -> {1} {2}% to {3}",
                    originalLength,
                    compressedStream.Length,
                    ((float)compressedStream.Length / (float)originalLength) * 100,
-                   _name));
+                   this.blob);
             }
             catch
             {
@@ -135,43 +257,8 @@ namespace Lucene.Net.Store.Azure
                 compressedStream.Dispose();
                 throw;
             }
+
             return compressedStream;
-        }
-
-        public override long Length
-        {
-            get
-            {
-                return _indexOutput.Length;
-            }
-        }
-
-        public override void WriteByte(byte b)
-        {
-            _indexOutput.WriteByte(b);
-        }
-
-        public override void WriteBytes(byte[] b, int length)
-        {
-            _indexOutput.WriteBytes(b, length);
-        }
-
-        public override void WriteBytes(byte[] b, int offset, int length)
-        {
-            _indexOutput.WriteBytes(b, offset, length);
-        }
-
-        public override long FilePointer
-        {
-            get
-            {
-                return _indexOutput.FilePointer;
-            }
-        }
-
-        public override void Seek(long pos)
-        {
-            _indexOutput.Seek(pos);
         }
     }
 }

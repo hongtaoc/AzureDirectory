@@ -1,6 +1,4 @@
-﻿using Microsoft.WindowsAzure.Storage;
-using Microsoft.WindowsAzure.Storage.Blob;
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -8,220 +6,284 @@ using System.Linq;
 
 namespace Lucene.Net.Store.Azure
 {
+    using System.Globalization;
+    using System.Net;
+    using System.Net.Http;
+    using System.Xml.Linq;
+    using System.Xml.XPath;
+
+    /// <summary>
+    /// The azure directory.
+    /// </summary>
     public class AzureDirectory : Directory
     {
-        private string _containerName;
-        private string _rootFolder;
-        private CloudBlobClient _blobClient;
-        private CloudBlobContainer _blobContainer;
-        private Directory _cacheDirectory;
-
-
-
+        /// <summary>
+        /// The _locks.
+        /// </summary>
+        private readonly Dictionary<string, AzureLock> locks = new Dictionary<string, AzureLock>();
 
         /// <summary>
-        /// Create an AzureDirectory
+        /// Initializes a new instance of the <see cref="AzureDirectory"/> class. 
         /// </summary>
-        /// <param name="storageAccount">storage account to use</param>
-        /// <param name="containerName">name of container (folder in blob storage)</param>
-        /// <param name="cacheDirectory">local Directory object to use for local cache</param>
-        /// <param name="rootFolder">path of the root folder inside the container</param>
+        /// <param name="accountName">The storage account name.</param>
+        /// <param name="accountKey">The storage account key.</param>
+        /// <param name="containerName">name of container (folder in blob storage).</param>
+        /// <param name="cacheDirectory">local Directory object to use for local cache.</param>
+        /// <param name="rootFolder">path of the root folder inside the container.</param>
         public AzureDirectory(
-            CloudStorageAccount storageAccount,
+            string accountName,
+            string accountKey,
             string containerName = null,
             Directory cacheDirectory = null,
-            bool compressBlobs = false,
             string rootFolder = null)
         {
-            if (storageAccount == null)
-                throw new ArgumentNullException("storageAccount");
-
-            if (string.IsNullOrEmpty(containerName))
-                _containerName = "lucene";
-            else
-                _containerName = containerName.ToLower();
-
-
-            if (string.IsNullOrEmpty(rootFolder))
-                _rootFolder = string.Empty;
-            else
+            if (string.IsNullOrEmpty(accountName))
             {
-                rootFolder = rootFolder.Trim('/');
-                _rootFolder = rootFolder + "/";
+                throw new ArgumentNullException("accountName");
             }
 
+            this.ContainerName = string.IsNullOrEmpty(containerName) ? "lucene" : containerName.ToLower();
+            this.RootFolder = string.IsNullOrEmpty(rootFolder) ? string.Empty : rootFolder.Trim('/') + "/";
 
-            _blobClient = storageAccount.CreateCloudBlobClient();
-            _initCacheDirectory(cacheDirectory);
-            this.CompressBlobs = compressBlobs;
+            StorageRestClient.AccountName = accountName;
+            StorageRestClient.AccountKey = accountKey;
+
+            this.InitCacheDirectory(cacheDirectory);
         }
 
-        public CloudBlobContainer BlobContainer
-        {
-            get
-            {
-                return _blobContainer;
-            }
-        }
+        /// <summary>
+        /// Gets the blob container name.
+        /// </summary>
+        public string ContainerName { get; private set; }
 
-        public bool CompressBlobs
-        {
-            get;
-            set;
-        }
+        /// <summary>
+        /// Gets the root folder.
+        /// </summary>
+        public string RootFolder { get; private set; }
 
+        /// <summary>
+        /// Gets the cache directory.
+        /// </summary>
+        public Directory CacheDirectory { get; private set; }
+
+        /// <summary>
+        /// Gets or sets a value indicating whether compress blobs.
+        /// </summary>
+        public bool CompressBlobs { get; set; }
+
+        /// <summary>
+        /// Clear the cache.
+        /// </summary>
         public void ClearCache()
         {
-            foreach (string file in _cacheDirectory.ListAll())
+            foreach (string file in this.CacheDirectory.ListAll())
             {
-                _cacheDirectory.DeleteFile(file);
+                this.CacheDirectory.DeleteFile(file);
             }
         }
 
-        public Directory CacheDirectory
-        {
-            get
-            {
-                return _cacheDirectory;
-            }
-            set
-            {
-                _cacheDirectory = value;
-            }
-        }
-
-        private void _initCacheDirectory(Directory cacheDirectory)
-        {
-            if (cacheDirectory != null)
-            {
-                // save it off
-                _cacheDirectory = cacheDirectory;
-            }
-            else
-            {
-                var cachePath = Path.Combine(Path.GetPathRoot(Environment.SystemDirectory), "AzureDirectory");
-                var azureDir = new DirectoryInfo(cachePath);
-                if (!azureDir.Exists)
-                    azureDir.Create();
-
-                var catalogPath = Path.Combine(cachePath, _containerName);
-                var catalogDir = new DirectoryInfo(catalogPath);
-                if (!catalogDir.Exists)
-                    catalogDir.Create();
-
-                _cacheDirectory = FSDirectory.Open(catalogPath);
-            }
-
-            CreateContainer();
-        }
-
+        /// <summary>
+        /// Create a blob container.
+        /// </summary>
         public void CreateContainer()
         {
-            _blobContainer = _blobClient.GetContainerReference(_containerName);
-            _blobContainer.CreateIfNotExists();
+            var existed = false;
+            StorageRestClient.Run(
+                HttpMethod.Get,
+                string.Format(CultureInfo.InvariantCulture, "{0}?restype=container", this.ContainerName),
+                null,
+                null,
+                response => { existed = response.StatusCode == HttpStatusCode.OK; }).Wait();
+
+            if (!existed)
+            {
+                StorageRestClient.Run(
+                    HttpMethod.Put,
+                    string.Format(CultureInfo.InvariantCulture, "{0}?restype=container", this.ContainerName),
+                    null,
+                    null,
+                    response =>
+                    {
+                        if (!response.IsSuccessStatusCode)
+                        {
+                            throw new Exception("Failed to create new container.");
+                        }
+                    }).Wait();
+            }
         }
 
-        /// <summary>Returns an array of strings, one for each file in the directory. </summary>
-        public override String[] ListAll()
+        /// <summary>
+        /// Returns an array of strings, one for each file in the directory. 
+        /// </summary>
+        /// <returns>
+        /// The file name in string array.
+        /// </returns>
+        public override string[] ListAll()
         {
-            var results = from blob in _blobContainer.ListBlobs(_rootFolder)
-                          select blob.Uri.AbsolutePath.Substring(blob.Uri.AbsolutePath.LastIndexOf('/') + 1);
-            return results.ToArray<string>();
+            XElement doc = null;
+            StorageRestClient.Run(
+                HttpMethod.Get,
+                string.Format(CultureInfo.InvariantCulture, "{0}?restype=container&comp=list", this.ContainerName),
+                null,
+                null,
+                response =>
+                {
+                    if (response.IsSuccessStatusCode)
+                    {
+                        doc = XDocument.Parse(response.Content.ReadAsStringAsync().Result).Root;
+                    }
+                }).Wait();
+
+            return doc == null ? new string[0] : doc.XPathSelectElements("./Blobs/Blob/Name").Select(b => b.Value).ToArray();
         }
 
-        /// <summary>Returns true if a file with the given name exists. </summary>
-        public override bool FileExists(String name)
+        /// <summary>
+        /// Returns true if a file with the given name exists. 
+        /// </summary>
+        /// <param name="name">The name.</param>
+        /// <returns>
+        /// The <see cref="bool"/>.
+        /// </returns>
+        public override bool FileExists(string name)
         {
-            // this always comes from the server
-            try
-            {
-                return _blobContainer.GetBlockBlobReference(_rootFolder + name).Exists();
-            }
-            catch (Exception)
-            {
-                return false;
-            }
+            var existed = false;
+            StorageRestClient.Run(
+                HttpMethod.Head,
+                string.Format(CultureInfo.InvariantCulture, "{0}/{1}", this.ContainerName, name),
+                null,
+                null,
+                response => { existed = response.IsSuccessStatusCode; }).Wait();
+
+            return existed;
         }
 
-        /// <summary>Returns the time the named file was last modified. </summary>
-        public override long FileModified(String name)
+        /// <summary>
+        /// Returns the time the named file was last modified. 
+        /// </summary>
+        /// <param name="name">The name.</param>
+        /// <returns>
+        /// The <see cref="long"/>.
+        /// </returns>
+        public override long FileModified(string name)
         {
-            // this always has to come from the server
-            try
-            {
-                var blob = _blobContainer.GetBlockBlobReference(_rootFolder + name);
-                blob.FetchAttributes();
-                return blob.Properties.LastModified.Value.UtcDateTime.ToFileTimeUtc();
-            }
-            catch
-            {
-                return 0;
-            }
+            var time = 0L;
+            StorageRestClient.Run(
+                HttpMethod.Head,
+                string.Format(CultureInfo.InvariantCulture, "{0}/{1}", this.ContainerName, name),
+                null,
+                null,
+                response =>
+                {
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var cachedModifyTime = response.Headers.FirstOrDefault(h => h.Key == StorageRestClient.MetadataHeaderTemplate + "CachedLastModified");
+                        if (long.TryParse(cachedModifyTime.Value.FirstOrDefault(), out time))
+                        {
+                            return;
+                        }
+
+                        if (response.Content.Headers.LastModified.HasValue)
+                        {
+                            time = response.Content.Headers.LastModified.Value.UtcDateTime.ToFileTimeUtc();
+                        }
+                    }
+                }).Wait();
+
+            return time;
         }
 
-        /// <summary>Set the modified time of an existing file to now. </summary>
-        public override void TouchFile(System.String name)
+        /// <summary>
+        /// Removes an existing file in the directory. 
+        /// </summary>
+        /// <param name="name">The name.</param>
+        public override void DeleteFile(string name)
         {
-            //BlobProperties props = _blobContainer.GetBlobProperties(_rootFolder + name);
-            //_blobContainer.UpdateBlobMetadata(props);
-            // I have no idea what the semantics of this should be...hmmmm...
-            // we never seem to get called
-            _cacheDirectory.TouchFile(name);
-            //SetCachedBlobProperties(props);
+            Debug.WriteLine(string.Format("DELETE {0}/{1}", this.ContainerName, name));
+
+            StorageRestClient.Run(
+                HttpMethod.Delete,
+                string.Format(CultureInfo.InvariantCulture, "{0}/{1}", this.ContainerName, name),
+                null,
+                null,
+                response =>
+                {
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        throw new Exception("Failed to delete a blob.");
+                    }
+                }).Wait();
+
+            if (this.CacheDirectory.FileExists(name + ".blob"))
+            {
+                this.CacheDirectory.DeleteFile(name + ".blob");
+            }
+
+            if (this.CacheDirectory.FileExists(name))
+            {
+                this.CacheDirectory.DeleteFile(name);
+            }
         }
 
-        /// <summary>Removes an existing file in the directory. </summary>
-        public override void DeleteFile(System.String name)
+        /// <summary>
+        /// Returns the length of a file in the directory. 
+        /// </summary>
+        /// <param name="name">The name.</param>
+        /// <returns>
+        /// The <see cref="long"/>.
+        /// </returns>
+        public override long FileLength(string name)
         {
-            var blob = _blobContainer.GetBlockBlobReference(_rootFolder + name);
-            blob.DeleteIfExists();
-            Debug.WriteLine(String.Format("DELETE {0}/{1}", _blobContainer.Uri.ToString(), name));
+            var length = 0L;
+            StorageRestClient.Run(
+                HttpMethod.Head,
+                string.Format(CultureInfo.InvariantCulture, "{0}/{1}", this.ContainerName, name),
+                null,
+                null,
+                response =>
+                {
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var lengthMetadata = response.Headers.FirstOrDefault(h => h.Key == StorageRestClient.MetadataHeaderTemplate + "CachedLength");
+                        if (long.TryParse(lengthMetadata.Value.FirstOrDefault(), out length))
+                        {
+                            return;
+                        }
 
-            if (_cacheDirectory.FileExists(name + ".blob"))
-            {
-                _cacheDirectory.DeleteFile(name + ".blob");
-            }
+                        if (response.Content.Headers.ContentLength.HasValue)
+                        {
+                            length = response.Content.Headers.ContentLength.Value;
+                        }
+                    }
+                }).Wait();
 
-            if (_cacheDirectory.FileExists(name))
-            {
-                _cacheDirectory.DeleteFile(name);
-            }
+            return length; // fall back to actual blob size
         }
 
-
-        /// <summary>Returns the length of a file in the directory. </summary>
-        public override long FileLength(String name)
-        {
-            var blob = _blobContainer.GetBlockBlobReference(_rootFolder + name);
-            blob.FetchAttributes();
-
-            // index files may be compressed so the actual length is stored in metatdata
-            string blobLegthMetadata;
-            bool hasMetadataValue = blob.Metadata.TryGetValue("CachedLength", out blobLegthMetadata);
-
-            long blobLength;
-            if (hasMetadataValue && long.TryParse(blobLegthMetadata, out blobLength))
-            {
-                return blobLength;
-            }
-            return blob.Properties.Length; // fall back to actual blob size
-        }
-
-        /// <summary>Creates a new, empty file in the directory with the given name.
+        /// <summary>
+        /// Creates a new, empty file in the directory with the given name.
         /// Returns a stream writing this file. 
         /// </summary>
-        public override IndexOutput CreateOutput(System.String name)
+        /// <param name="name">The name.</param>
+        /// <returns>
+        /// The <see cref="IndexOutput"/>.
+        /// </returns>
+        public override IndexOutput CreateOutput(string name)
         {
-            var blob = _blobContainer.GetBlockBlobReference(_rootFolder + name);
-            return new AzureIndexOutput(this, blob);
+            return new AzureIndexOutput(this, this.RootFolder + name);
         }
 
-        /// <summary>Returns a stream reading an existing file. </summary>
-        public override IndexInput OpenInput(System.String name)
+        /// <summary>
+        /// Returns a stream reading an existing file. 
+        /// </summary>
+        /// <param name="name">The name.</param>
+        /// <returns>
+        /// The <see cref="IndexInput"/>.
+        /// </returns>
+        public override IndexInput OpenInput(string name)
         {
             try
             {
-                var blob = _blobContainer.GetBlockBlobReference(_rootFolder + name);
+                var blob = _blobContainer.GetBlockBlobReference(RootFolder + name);
                 blob.FetchAttributes();
                 return new AzureIndexInput(this, blob);
             }
@@ -231,48 +293,55 @@ namespace Lucene.Net.Store.Azure
             }
         }
 
-        private Dictionary<string, AzureLock> _locks = new Dictionary<string, AzureLock>();
-
         /// <summary>Construct a {@link Lock}.</summary>
         /// <param name="name">the name of the lock file
         /// </param>
-        public override Lock MakeLock(System.String name)
+        /// <returns>The lock.</returns>
+        public override Lock MakeLock(string name)
         {
-            lock (_locks)
+            lock (this.locks)
             {
-                if (!_locks.ContainsKey(name))
+                if (!this.locks.ContainsKey(name))
                 {
-                    _locks.Add(name, new AzureLock(_rootFolder + name, this));
+                    this.locks.Add(name, new AzureLock(this.RootFolder + name, this));
                 }
-                return _locks[name];
+
+                return this.locks[name];
             }
         }
 
+        /// <summary>
+        /// Clear the lock.
+        /// </summary>
+        /// <param name="name">The name.</param>
         public override void ClearLock(string name)
         {
-            lock (_locks)
+            lock (this.locks)
             {
-                if (_locks.ContainsKey(name))
+                if (this.locks.ContainsKey(name))
                 {
-                    _locks[name].BreakLock();
+                    this.locks[name].BreakLock();
                 }
             }
-            _cacheDirectory.ClearLock(name);
+
+            this.CacheDirectory.ClearLock(name);
         }
 
-        /// <summary>Closes the store. </summary>
-        protected override void Dispose(bool disposing)
-        {
-            _blobContainer = null;
-            _blobClient = null;
-        }
-
+        /// <summary>
+        /// Check whether should compress file.
+        /// </summary>
+        /// <param name="path">The path.</param>
+        /// <returns>
+        /// True when compression is needed.
+        /// </returns>
         public virtual bool ShouldCompressFile(string path)
         {
-            if (!CompressBlobs)
+            if (!this.CompressBlobs)
+            {
                 return false;
+            }
 
-            var ext = System.IO.Path.GetExtension(path);
+            var ext = Path.GetExtension(path);
             switch (ext)
             {
                 case ".cfs":
@@ -289,18 +358,83 @@ namespace Lucene.Net.Store.Azure
                     return true;
                 default:
                     return false;
-            };
+            }
         }
+
+        /// <summary>
+        /// Open cached input as stream.
+        /// </summary>
+        /// <param name="name">The name.</param>
+        /// <returns>
+        /// The <see cref="StreamInput"/>.
+        /// </returns>
         public StreamInput OpenCachedInputAsStream(string name)
         {
-            return new StreamInput(CacheDirectory.OpenInput(name));
+            return new StreamInput(this.CacheDirectory.OpenInput(name));
         }
 
+        /// <summary>
+        /// Create cached output as stream.
+        /// </summary>
+        /// <param name="name">The name.</param>
+        /// <returns>
+        /// The <see cref="StreamOutput"/>.
+        /// </returns>
         public StreamOutput CreateCachedOutputAsStream(string name)
         {
-            return new StreamOutput(CacheDirectory.CreateOutput(name));
+            return new StreamOutput(this.CacheDirectory.CreateOutput(name));
         }
 
-    }
+        /// <summary>Set the modified time of an existing file to now. </summary>
+        /// <param name="name">The name.</param>
+        public override void TouchFile(string name)
+        {
+            this.CacheDirectory.TouchFile(name);
+        }
 
+        /// <summary>
+        /// Closes the store. 
+        /// </summary>
+        /// <param name="disposing">The disposing.</param>
+        protected override void Dispose(bool disposing)
+        {
+            foreach (var l in this.locks)
+            {
+                this.CacheDirectory.ClearLock(l.Key);
+            }
+        }
+
+        /// <summary>
+        /// Initialize the cache directory.
+        /// </summary>
+        /// <param name="cacheDirectory">The cache directory.</param>
+        private void InitCacheDirectory(Directory cacheDirectory)
+        {
+            if (cacheDirectory != null)
+            {
+                // save it off
+                this.CacheDirectory = cacheDirectory;
+            }
+            else
+            {
+                var cachePath = Path.Combine(Path.GetPathRoot(Environment.SystemDirectory), "AzureDirectory");
+                var azureDir = new DirectoryInfo(cachePath);
+                if (!azureDir.Exists)
+                {
+                    azureDir.Create();
+                }
+
+                var catalogPath = Path.Combine(cachePath, this.ContainerName);
+                var catalogDir = new DirectoryInfo(catalogPath);
+                if (!catalogDir.Exists)
+                {
+                    catalogDir.Create();
+                }
+
+                this.CacheDirectory = FSDirectory.Open(catalogPath);
+            }
+
+            this.CreateContainer();
+        }
+    }
 }

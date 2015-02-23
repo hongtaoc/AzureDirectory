@@ -1,5 +1,4 @@
-﻿using Microsoft.WindowsAzure.Storage.Blob;
-using System;
+﻿using System;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
@@ -7,80 +6,103 @@ using System.Threading;
 
 namespace Lucene.Net.Store.Azure
 {
+    using System.Net.Http;
+
     /// <summary>
     /// Implements IndexInput semantics for a read only blob
     /// </summary>
     public class AzureIndexInput : IndexInput
     {
-        private AzureDirectory _azureDirectory;
-        private CloudBlobContainer _blobContainer;
-        private ICloudBlob _blob;
-        private string _name;
+        /// <summary>
+        /// The blob.
+        /// </summary>
+        private readonly string blob;
 
-        private IndexInput _indexInput;
-        private Mutex _fileMutex;
+        /// <summary>
+        /// The _file mutex.
+        /// </summary>
+        private readonly Mutex fileMutex;
 
-        public Lucene.Net.Store.Directory CacheDirectory { get { return _azureDirectory.CacheDirectory; } }
+        /// <summary>
+        /// The _azure directory.
+        /// </summary>
+        private AzureDirectory azureDirectory;
 
-        public AzureIndexInput(AzureDirectory azuredirectory, ICloudBlob blob)
+        /// <summary>
+        /// The index input.
+        /// </summary>
+        private IndexInput indexInput;
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="AzureIndexInput"/> class.
+        /// </summary>
+        /// <param name="cloneInput">The clone input.</param>
+        public AzureIndexInput(AzureIndexInput cloneInput)
         {
-            _name = blob.Uri.Segments[blob.Uri.Segments.Length - 1];
+            this.fileMutex = BlobMutexManager.GrabMutex(cloneInput.blob);
+            this.fileMutex.WaitOne();
 
-#if FULLDEBUG
-            Debug.WriteLine(String.Format("opening {0} ", _name));
-#endif
-            _fileMutex = BlobMutexManager.GrabMutex(_name);
-            _fileMutex.WaitOne();
             try
             {
-                _azureDirectory = azuredirectory;
-                _blobContainer = azuredirectory.BlobContainer;
-                _blob = blob;
+                Debug.WriteLine(string.Format("Creating clone for {0}", cloneInput.blob));
 
-                var fileName = _name;
+                this.azureDirectory = cloneInput.azureDirectory;
+                this.blob = cloneInput.blob;
+                this.indexInput = cloneInput.indexInput.Clone() as IndexInput;
+            }
+            catch (Exception)
+            {
+                // sometimes we get access denied on the 2nd stream...but not always. I haven't tracked it down yet
+                // but this covers our tail until I do
+                Debug.WriteLine(string.Format("Dagnabbit, falling back to memory clone for {0}", cloneInput.blob));
+            }
+            finally
+            {
+                this.fileMutex.ReleaseMutex();
+            }
+        }
 
-                var fFileNeeded = false;
-                if (!CacheDirectory.FileExists(fileName))
+        /// <summary>
+        /// Initializes a new instance of the <see cref="AzureIndexInput"/> class.
+        /// </summary>
+        /// <param name="azureDirectory">The azure directory.</param>
+        /// <param name="blob">The blob.</param>
+        public AzureIndexInput(AzureDirectory azureDirectory, string blob)
+        {
+            Debug.WriteLine(string.Format("opening {0} ", blob));
+
+            this.fileMutex = BlobMutexManager.GrabMutex(blob);
+            this.fileMutex.WaitOne();
+            try
+            {
+                this.azureDirectory = azureDirectory;
+                this.blob = blob;
+
+                var fileNeeded = !this.azureDirectory.CacheDirectory.FileExists(blob);
+                if (fileNeeded)
                 {
-                    fFileNeeded = true;
-                }
-                else
-                {
-                    long cachedLength = CacheDirectory.FileLength(fileName);
-                    string blobLengthMetadata;
-                    bool hasMetadataValue = blob.Metadata.TryGetValue("CachedLength", out blobLengthMetadata); 
-                    long blobLength = blob.Properties.Length;
-                    if (hasMetadataValue) long.TryParse(blobLengthMetadata, out blobLength);
+                    var cachedLength = this.azureDirectory.CacheDirectory.FileLength(blob);
+                    var blobLength = this.azureDirectory.FileLength(blob);
 
-                    string blobLastModifiedMetadata;
-                    long longLastModified = 0;
-                    DateTime blobLastModifiedUTC = blob.Properties.LastModified.Value.UtcDateTime;
-                    if (blob.Metadata.TryGetValue("CachedLastModified", out blobLastModifiedMetadata)) {
-                        if (long.TryParse(blobLastModifiedMetadata, out longLastModified))
-                            blobLastModifiedUTC = new DateTime(longLastModified).ToUniversalTime();
-                    }
-                    
-                    if (cachedLength != blobLength)
-                        fFileNeeded = true;
-                    else
+                    fileNeeded = cachedLength != blobLength;
+                    if (fileNeeded)
                     {
-
                         // cachedLastModifiedUTC was not ouputting with a date (just time) and the time was always off
-                        long unixDate = CacheDirectory.FileModified(fileName);
-                        DateTime start = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
-                        var cachedLastModifiedUTC = start.AddMilliseconds(unixDate).ToUniversalTime();
-                        
-                        if (cachedLastModifiedUTC != blobLastModifiedUTC)
+                        var unixDate = this.azureDirectory.CacheDirectory.FileModified(blob);
+                        var start = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+                        var cachedLastModifiedUtc = start.AddMilliseconds(unixDate).ToUniversalTime();
+
+                        var blobLastModifiedUtc = new DateTime(this.azureDirectory.FileModified(blob)).ToUniversalTime();
+
+                        fileNeeded = cachedLastModifiedUtc != blobLastModifiedUtc;
+                        if (fileNeeded)
                         {
-                            var timeSpan = blobLastModifiedUTC.Subtract(cachedLastModifiedUTC);
-                            if (timeSpan.TotalSeconds > 1)
-                                fFileNeeded = true;
-                            else
+                            var timeSpan = blobLastModifiedUtc.Subtract(cachedLastModifiedUtc);
+                            fileNeeded = timeSpan.TotalSeconds > 1;
+                            if (!fileNeeded)
                             {
-#if FULLDEBUG
-                                Debug.WriteLine(timeSpan.TotalSeconds);
-#endif
                                 // file not needed
+                                Debug.WriteLine(timeSpan.TotalSeconds);
                             }
                         }
                     }
@@ -88,43 +110,169 @@ namespace Lucene.Net.Store.Azure
 
                 // if the file does not exist
                 // or if it exists and it is older then the lastmodified time in the blobproperties (which always comes from the blob storage)
-                if (fFileNeeded)
+                if (fileNeeded)
                 {
-                    if (_azureDirectory.ShouldCompressFile(_name))
+                    if (this.azureDirectory.ShouldCompressFile(blob))
                     {
-                        InflateStream(fileName);
+                        this.InflateStream(blob);
                     }
                     else
                     {
-                        using (var fileStream = _azureDirectory.CreateCachedOutputAsStream(fileName))
+                        using (var fileStream = this.azureDirectory.CreateCachedOutputAsStream(blob))
                         {
                             // get the blob
-                            _blob.DownloadToStream(fileStream);
+                            StorageRestClient.Run(
+                                HttpMethod.Get,
+                                string.Format("{0}/{1}", this.azureDirectory.ContainerName, blob),
+                                null,
+                                null,
+                                response =>
+                                {
+                                    if (!response.IsSuccessStatusCode || response.Content == null)
+                                    {
+                                        return;
+                                    }
+
+                                    using (var azureStream = response.Content.ReadAsStreamAsync().Result)
+                                    {
+                                        azureStream.CopyTo(fileStream);
+                                    }
+                                }).Wait();
 
                             fileStream.Flush();
-                            Debug.WriteLine(string.Format("GET {0} RETREIVED {1} bytes", _name, fileStream.Length));
+                            Debug.WriteLine("GET {0} RETREIVED {1} bytes", blob, fileStream.Length);
                         }
                     }
-
-                    // and open it as an input 
-                    _indexInput = CacheDirectory.OpenInput(fileName);
                 }
                 else
                 {
-#if FULLDEBUG
-                    Debug.WriteLine(String.Format("Using cached file for {0}", _name));
-#endif
-
-                    // open the file in read only mode
-                    _indexInput = CacheDirectory.OpenInput(fileName);
+                    Debug.WriteLine(string.Format("Using cached file for {0}", blob));
                 }
+
+                // and open it as an input 
+                this.indexInput = this.azureDirectory.CacheDirectory.OpenInput(blob);
             }
             finally
             {
-                _fileMutex.ReleaseMutex();
+                this.fileMutex.ReleaseMutex();
             }
         }
 
+        /// <summary>
+        /// Gets the file pointer.
+        /// </summary>
+        public override long FilePointer
+        {
+            get
+            {
+                return this.indexInput.FilePointer;
+            }
+        }
+
+        /// <summary>
+        /// Read a byte.
+        /// </summary>
+        /// <returns>
+        /// The <see cref="byte"/>.
+        /// </returns>
+        public override byte ReadByte()
+        {
+            return this.indexInput.ReadByte();
+        }
+
+        /// <summary>
+        /// Read bytes.
+        /// </summary>
+        /// <param name="b">
+        /// The bytes.
+        /// </param>
+        /// <param name="offset">
+        /// The offset.
+        /// </param>
+        /// <param name="len">
+        /// The length.
+        /// </param>
+        public override void ReadBytes(byte[] b, int offset, int len)
+        {
+            this.indexInput.ReadBytes(b, offset, len);
+        }
+
+        /// <summary>
+        /// Seek in the index input.
+        /// </summary>
+        /// <param name="pos">The position.</param>
+        public override void Seek(long pos)
+        {
+            this.indexInput.Seek(pos);
+        }
+
+        /// <summary>
+        /// Get the index input length.
+        /// </summary>
+        /// <returns>
+        /// The <see cref="long"/>.
+        /// </returns>
+        public override long Length()
+        {
+            return this.indexInput.Length();
+        }
+
+        /// <summary>
+        /// Clone the index input.
+        /// </summary>
+        /// <returns>
+        /// The <see cref="object"/>.
+        /// </returns>
+        public override object Clone()
+        {
+            IndexInput clone = null;
+            try
+            {
+                this.fileMutex.WaitOne();
+                var input = new AzureIndexInput(this);
+                clone = input;
+            }
+            catch (Exception err)
+            {
+                Debug.WriteLine(err.ToString());
+            }
+            finally
+            {
+                this.fileMutex.ReleaseMutex();
+            }
+
+            Debug.Assert(clone != null, "Cannot clone null reference.");
+            return clone;
+        }
+
+        /// <summary>
+        /// Dispose the index input.
+        /// </summary>
+        /// <param name="disposing">
+        /// The disposing.
+        /// </param>
+        protected override void Dispose(bool disposing)
+        {
+            this.fileMutex.WaitOne();
+            try
+            {
+                Debug.WriteLine(string.Format("CLOSED READSTREAM local {0}", this.blob));
+
+                this.indexInput.Dispose();
+                this.indexInput = null;
+                this.azureDirectory = null;
+                GC.SuppressFinalize(this);
+            }
+            finally
+            {
+                this.fileMutex.ReleaseMutex();
+            }
+        }
+
+        /// <summary>
+        /// The inflate stream.
+        /// </summary>
+        /// <param name="fileName">The file name.</param>
         private void InflateStream(string fileName)
         {
             // then we will get it fresh into local deflatedName 
@@ -132,125 +280,46 @@ namespace Lucene.Net.Store.Azure
             using (var deflatedStream = new MemoryStream())
             {
                 // get the deflated blob
-                _blob.DownloadToStream(deflatedStream);
+                StorageRestClient.Run(
+                    HttpMethod.Get,
+                    string.Format("{0}/{1}", this.azureDirectory.ContainerName, this.blob),
+                    null,
+                    null,
+                    response =>
+                        {
+                            if (!response.IsSuccessStatusCode || response.Content == null)
+                            {
+                                return;
+                            }
 
-                Debug.WriteLine(string.Format("GET {0} RETREIVED {1} bytes", _name, deflatedStream.Length));
+                            using (var azureStream = response.Content.ReadAsStreamAsync().Result)
+                            {
+                                azureStream.CopyTo(deflatedStream);
+                            }
+                        }).Wait();
+
+                Debug.WriteLine("GET {0} RETREIVED {1} bytes", this.blob, deflatedStream.Length);
 
                 // seek back to begininng
                 deflatedStream.Seek(0, SeekOrigin.Begin);
 
                 // open output file for uncompressed contents
-                using (var fileStream = _azureDirectory.CreateCachedOutputAsStream(fileName))
+                using (var fileStream = this.azureDirectory.CreateCachedOutputAsStream(fileName))
                 using (var decompressor = new DeflateStream(deflatedStream, CompressionMode.Decompress))
                 {
                     var bytes = new byte[65535];
-                    var nRead = 0;
+                    int read;
                     do
                     {
-                        nRead = decompressor.Read(bytes, 0, 65535);
-                        if (nRead > 0)
-                            fileStream.Write(bytes, 0, nRead);
-                    } while (nRead == 65535);
+                        read = decompressor.Read(bytes, 0, 65535);
+                        if (read > 0)
+                        {
+                            fileStream.Write(bytes, 0, read);
+                        }
+                    }
+                    while (read == 65535);
                 }
             }
         }
-
-        public AzureIndexInput(AzureIndexInput cloneInput)
-        {
-            _fileMutex = BlobMutexManager.GrabMutex(cloneInput._name);
-            _fileMutex.WaitOne();
-
-            try
-            {
-#if FULLDEBUG
-                Debug.WriteLine(String.Format("Creating clone for {0}", cloneInput._name));
-#endif
-                _azureDirectory = cloneInput._azureDirectory;
-                _blobContainer = cloneInput._blobContainer;
-                _blob = cloneInput._blob;
-                _indexInput = cloneInput._indexInput.Clone() as IndexInput;
-            }
-            catch (Exception)
-            {
-                // sometimes we get access denied on the 2nd stream...but not always. I haven't tracked it down yet
-                // but this covers our tail until I do
-                Debug.WriteLine(String.Format("Dagnabbit, falling back to memory clone for {0}", cloneInput._name));
-            }
-            finally
-            {
-                _fileMutex.ReleaseMutex();
-            }
-        }
-
-        public override byte ReadByte()
-        {
-            return _indexInput.ReadByte();
-        }
-
-        public override void ReadBytes(byte[] b, int offset, int len)
-        {
-            _indexInput.ReadBytes(b, offset, len);
-        }
-
-        public override long FilePointer
-        {
-            get
-            {
-                return _indexInput.FilePointer;
-            }
-        }
-
-        public override void Seek(long pos)
-        {
-            _indexInput.Seek(pos);
-        }
-
-        protected override void Dispose(bool disposing)
-        {
-            _fileMutex.WaitOne();
-            try
-            {
-#if FULLDEBUG
-                Debug.WriteLine(String.Format("CLOSED READSTREAM local {0}", _name));
-#endif
-                _indexInput.Dispose();
-                _indexInput = null;
-                _azureDirectory = null;
-                _blobContainer = null;
-                _blob = null;
-                GC.SuppressFinalize(this);
-            }
-            finally
-            {
-                _fileMutex.ReleaseMutex();
-            }
-        }
-
-        public override long Length()
-        {
-            return _indexInput.Length();
-        }
-
-        public override System.Object Clone()
-        {
-            IndexInput clone = null;
-            try
-            {
-                _fileMutex.WaitOne();
-                AzureIndexInput input = new AzureIndexInput(this);
-                clone = (IndexInput)input;
-            }
-            catch (System.Exception err)
-            {
-                Debug.WriteLine(err.ToString());
-            }
-            finally
-            {
-                _fileMutex.ReleaseMutex();
-            }
-            Debug.Assert(clone != null);
-            return clone;
-        }
-
     }
 }

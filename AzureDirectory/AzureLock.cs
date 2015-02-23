@@ -1,153 +1,348 @@
-﻿using Microsoft.WindowsAzure.Storage;
-using Microsoft.WindowsAzure.Storage.Blob;
-using System;
+﻿using System;
 using System.Diagnostics;
 using System.IO;
 using System.Threading;
 
 namespace Lucene.Net.Store.Azure
 {
+    using System.Collections.Generic;
+    using System.Globalization;
+    using System.Linq;
+    using System.Net;
+    using System.Net.Http;
+
     /// <summary>
     /// Implements lock semantics on AzureDirectory via a blob lease
     /// </summary>
-    public class AzureLock : Lock
+    public class AzureLock : Lock, IDisposable
     {
-        private string _lockFile;
-        private AzureDirectory _azureDirectory;
-        private string _leaseid;
+        /// <summary>
+        /// The _lock file.
+        /// </summary>
+        private readonly string lockFile;
 
+        /// <summary>
+        /// The _azure directory.
+        /// </summary>
+        private readonly AzureDirectory azureDirectory;
+
+        /// <summary>
+        /// The lease id.
+        /// </summary>
+        private string leaseId;
+
+        /// <summary>
+        /// The renew timer.
+        /// </summary>
+        private Timer renewTimer;
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="AzureLock"/> class.
+        /// </summary>
+        /// <param name="lockFile">
+        /// The lock file.
+        /// </param>
+        /// <param name="directory">
+        /// The directory.
+        /// </param>
         public AzureLock(string lockFile, AzureDirectory directory)
         {
-            _lockFile = lockFile;
-            _azureDirectory = directory;
+            this.lockFile = lockFile;
+            this.azureDirectory = directory;
         }
 
         #region Lock methods
-        override public bool IsLocked()
+
+        /// <summary>
+        /// Check if the azure lock is locked.
+        /// </summary>
+        /// <returns>
+        /// The <see cref="bool"/>.
+        /// </returns>
+        public override bool IsLocked()
         {
-            var blob = _azureDirectory.BlobContainer.GetBlobReferenceFromServer(_lockFile);
-            try
+            var statusCode = HttpStatusCode.OK;
+
+            if (!string.IsNullOrEmpty(this.leaseId))
             {
-                Debug.Print("IsLocked() : {0}", _leaseid);
-                if (String.IsNullOrEmpty(_leaseid))
-                {
-                    var tempLease = blob.AcquireLease(TimeSpan.FromSeconds(60), _leaseid);
-                    if (String.IsNullOrEmpty(tempLease))
+                Debug.Print("IsLocked() : {0}", this.leaseId);
+                return string.IsNullOrEmpty(this.leaseId);
+            }
+
+            do
+            {
+                var tempLease = string.Empty;
+                StorageRestClient.Run(
+                    HttpMethod.Put,
+                    string.Format("{0}/{1}?comp=lease", this.azureDirectory.ContainerName, this.lockFile),
+                    new Dictionary<string, string>
+                        {
+                            { "x-ms-lease-action", "acquire" },
+                            { "x-ms-lease-duration", "60" },
+                            { "x-ms-proposed-lease-id", this.leaseId }
+                        },
+                    null,
+                    response =>
                     {
-                        Debug.Print("IsLocked() : TRUE");
-                        return true;
-                    }
-                    blob.ReleaseLease(new AccessCondition() { LeaseId = tempLease });
+                        statusCode = response.StatusCode;
+                        if (response.IsSuccessStatusCode)
+                        {
+                            tempLease = response.Headers.GetValues("x-ms-lease-id").FirstOrDefault();
+                        }
+                    }).Wait();
+
+                if (string.IsNullOrEmpty(tempLease))
+                {
+                    Debug.Print("IsLocked() : TRUE");
+                    return true;
                 }
-                Debug.Print("IsLocked() : {0}", _leaseid);
-                return String.IsNullOrEmpty(_leaseid);
+
+                StorageRestClient.Run(
+                    HttpMethod.Put,
+                    string.Format("{0}/{1}?comp=lease", this.azureDirectory.ContainerName, this.lockFile),
+                    new Dictionary<string, string>
+                        {
+                            { "x-ms-lease-action", "release" },
+                            { "x-ms-lease-id", tempLease }
+                        },
+                    null,
+                    response =>
+                    {
+                        statusCode = response.StatusCode;
+                    }).Wait();
             }
-            catch (StorageException webErr)
-            {
-                if (_handleWebException(blob, webErr))
-                    return IsLocked();
-            }
-            _leaseid = null;
+            while (statusCode != HttpStatusCode.OK && this.HandleWebException(statusCode));
+
+            this.leaseId = null;
             return false;
         }
 
+        /// <summary>
+        /// The obtain.
+        /// </summary>
+        /// <returns>
+        /// The <see cref="bool"/>.
+        /// </returns>
         public override bool Obtain()
         {
-            var blob = _azureDirectory.BlobContainer.GetBlockBlobReference(_lockFile);
-            try
-            {
-                Debug.Print("AzureLock:Obtain({0}) : {1}", _lockFile, _leaseid);
-                if (String.IsNullOrEmpty(_leaseid))
-                {
-                    _leaseid = blob.AcquireLease(TimeSpan.FromSeconds(60), _leaseid);
-                    Debug.Print("AzureLock:Obtain({0}): AcquireLease : {1}", _lockFile, _leaseid);
-                    
-                    // keep the lease alive by renewing every 30 seconds
-                    long interval = (long)TimeSpan.FromSeconds(30).TotalMilliseconds;
-                    _renewTimer = new Timer((obj) => 
-                        {
-                            try
-                            {
-                                AzureLock al = (AzureLock)obj;
-                                al.Renew();
-                            }
-                            catch (Exception err) { Debug.Print(err.ToString()); } 
-                        }, this, interval, interval);
-                }
-                return !String.IsNullOrEmpty(_leaseid);
-            }
-            catch (StorageException webErr)
-            {
-                if (_handleWebException(blob, webErr))
-                    return Obtain();
-            }
-            return false;
-        }
+            Debug.Print("AzureLock:Obtain({0}) : {1}", this.lockFile, this.leaseId);
 
-        private Timer _renewTimer;
-
-        public void Renew()
-        {
-            if (!String.IsNullOrEmpty(_leaseid))
+            if (!string.IsNullOrEmpty(this.leaseId))
             {
-                Debug.Print("AzureLock:Renew({0} : {1}", _lockFile, _leaseid);
-                var blob = _azureDirectory.BlobContainer.GetBlockBlobReference(_lockFile);
-                blob.RenewLease(new AccessCondition { LeaseId = _leaseid });
-            }
-        }
-
-        public override void Release()
-        {
-            Debug.Print("AzureLock:Release({0}) {1}", _lockFile, _leaseid);
-            if (!String.IsNullOrEmpty(_leaseid))
-            {
-                var blob = _azureDirectory.BlobContainer.GetBlockBlobReference(_lockFile);
-                blob.ReleaseLease(new AccessCondition { LeaseId = _leaseid });
-                if (_renewTimer != null)
-                {
-                    _renewTimer.Dispose();
-                    _renewTimer = null;
-                }
-                _leaseid = null;
-            }
-        }
-        #endregion
-
-        public void BreakLock()
-        {
-            Debug.Print("AzureLock:BreakLock({0}) {1}", _lockFile, _leaseid);
-            var blob = _azureDirectory.BlobContainer.GetBlockBlobReference(_lockFile);
-            try
-            {
-                blob.BreakLease();
-            }
-            catch (Exception)
-            {
-            }
-            _leaseid = null;
-        }
-
-        public override System.String ToString()
-        {
-            return String.Format("AzureLock@{0}.{1}", _lockFile, _leaseid);
-        }
-
-        private bool _handleWebException(ICloudBlob blob, StorageException err)
-        {
-            if (err.RequestInformation.HttpStatusCode == 404 || err.RequestInformation.HttpStatusCode == 409)
-            {
-                _azureDirectory.CreateContainer();
-                using (var stream = new MemoryStream())
-                using (var writer = new StreamWriter(stream))
-                {
-                    writer.Write(_lockFile);
-                    blob.UploadFromStream(stream);
-                }
                 return true;
             }
-            return false;
+
+            var statusCode = HttpStatusCode.OK;
+            do
+            {
+                StorageRestClient.Run(
+                    HttpMethod.Put,
+                    string.Format("{0}/{1}?comp=lease", this.azureDirectory.ContainerName, this.lockFile),
+                    new Dictionary<string, string>
+                    {
+                        { "x-ms-lease-action", "acquire" },
+                        { "x-ms-lease-duration", "60" },
+                        { "x-ms-proposed-lease-id", this.leaseId }
+                    },
+                    null,
+                    response =>
+                    {
+                        statusCode = response.StatusCode;
+                        if (response.IsSuccessStatusCode)
+                        {
+                            this.leaseId = response.Headers.GetValues("x-ms-lease-id").FirstOrDefault();
+                        }
+                    }).Wait();
+
+                Debug.Print("AzureLock:Obtain({0}): AcquireLease : {1}", this.lockFile, this.leaseId);
+            }
+            while (statusCode != HttpStatusCode.OK && this.HandleWebException(statusCode));
+
+            // keep the lease alive by renewing every 30 seconds
+            var interval = (long)TimeSpan.FromSeconds(30).TotalMilliseconds;
+            this.renewTimer = new Timer(
+                obj =>
+                {
+                    try
+                    {
+                        var al = (AzureLock)obj;
+                        al.Renew();
+                    }
+                    catch (Exception err)
+                    {
+                        Debug.Print(err.ToString());
+                    }
+                },
+                this,
+                interval,
+                interval);
+
+            return !string.IsNullOrEmpty(this.leaseId);
         }
 
-    }
+        /// <summary>
+        /// Renew the lock.
+        /// </summary>
+        public void Renew()
+        {
+            if (string.IsNullOrEmpty(this.leaseId))
+            {
+                return;
+            }
 
+            Debug.Print("AzureLock:Renew({0} : {1}", this.lockFile, this.leaseId);
+
+            StorageRestClient.Run(
+                HttpMethod.Put,
+                string.Format("{0}/{1}?comp=lease", this.azureDirectory.ContainerName, this.lockFile),
+                new Dictionary<string, string>
+                    {
+                        { "x-ms-lease-action", "renew" },
+                        { "x-ms-lease-id", this.leaseId }
+                    },
+                null,
+                response =>
+                {
+                    if (response.IsSuccessStatusCode)
+                    {
+                        throw new Exception("Failed to rebnew the blob lease.");
+                    }
+                }).Wait();
+        }
+
+        /// <summary>
+        /// Release the lock.
+        /// </summary>
+        public override void Release()
+        {
+            Debug.Print("AzureLock:Release({0}) {1}", this.lockFile, this.leaseId);
+
+            if (string.IsNullOrEmpty(this.leaseId))
+            {
+                return;
+            }
+
+            StorageRestClient.Run(
+                HttpMethod.Put,
+                string.Format("{0}/{1}?comp=lease", this.azureDirectory.ContainerName, this.lockFile),
+                new Dictionary<string, string>
+                    {
+                        { "x-ms-lease-action", "release" },
+                        { "x-ms-lease-id", this.leaseId }
+                    },
+                null,
+                response =>
+                {
+                    if (response.IsSuccessStatusCode)
+                    {
+                        throw new Exception("Failed to release the blob lease.");
+                    }
+                }).Wait();
+
+            if (this.renewTimer != null)
+            {
+                this.renewTimer.Dispose();
+                this.renewTimer = null;
+            }
+
+            this.leaseId = null;
+        }
+
+        #endregion
+
+        /// <summary>
+        /// Break the lock.
+        /// </summary>
+        public void BreakLock()
+        {
+            Debug.Print("AzureLock:BreakLock({0}) {1}", this.lockFile, this.leaseId);
+
+            if (string.IsNullOrEmpty(this.leaseId))
+            {
+                return;
+            }
+
+            StorageRestClient.Run(
+                HttpMethod.Put,
+                string.Format("{0}/{1}?comp=lease", this.azureDirectory.ContainerName, this.lockFile),
+                new Dictionary<string, string>
+                {
+                    { "x-ms-lease-action", "break" },
+                    { "x-ms-lease-id", this.leaseId }
+                },
+                null,
+                response =>
+                {
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        Trace.TraceError("Failed to break the blob lease.");
+                    }
+                }).Wait();
+
+            this.leaseId = null;
+        }
+
+        /// <summary>
+        /// The to string.
+        /// </summary>
+        /// <returns>
+        /// The <see cref="string"/>.
+        /// </returns>
+        public override string ToString()
+        {
+            return string.Format("AzureLock@{0}.{1}", this.lockFile, this.leaseId);
+        }
+
+        /// <summary>
+        /// The dispose.
+        /// </summary>
+        public void Dispose()
+        {
+            if (this.renewTimer == null)
+            {
+                return;
+            }
+
+            this.renewTimer.Dispose();
+            this.renewTimer = null;
+        }
+
+        /// <summary>
+        /// The handle web exception.
+        /// </summary>
+        /// <param name="statusCode">The status code.</param>
+        /// <returns>
+        /// The <see cref="bool"/>.
+        /// </returns>
+        private bool HandleWebException(HttpStatusCode statusCode)
+        {
+            if (statusCode != HttpStatusCode.NotFound && statusCode != HttpStatusCode.Conflict)
+            {
+                return false;
+            }
+
+            this.azureDirectory.CreateContainer();
+
+            using (var stream = new MemoryStream())
+            using (var writer = new StreamWriter(stream))
+            {
+                writer.Write(this.lockFile);
+
+                StorageRestClient.Run(
+                    HttpMethod.Put,
+                    string.Format(CultureInfo.InvariantCulture, "{0}/{1}", this.azureDirectory.ContainerName, this.lockFile),
+                    null,
+                    Tuple.Create(string.Empty, (Stream)stream),
+                    response =>
+                    {
+                        if (!response.IsSuccessStatusCode)
+                        {
+                            throw new Exception("Failed to upload lock file.");
+                        }
+                    }).Wait();
+            }
+
+            return true;
+        }
+    }
 }

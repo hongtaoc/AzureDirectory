@@ -4,7 +4,6 @@ using Lucene.Net.Index;
 using Lucene.Net.Search;
 using Lucene.Net.Store;
 using Lucene.Net.Store.Azure;
-using Microsoft.WindowsAzure.Storage;
 using System;
 using System.Configuration;
 using System.Diagnostics;
