@@ -24,6 +24,16 @@
         public const string MetadataHeaderTemplate = "x-ms-meta-";
 
         /// <summary>
+        /// The account name.
+        /// </summary>
+        private static string accountName;
+
+        /// <summary>
+        /// The base address.
+        /// </summary>
+        private static Uri baseAddress;
+
+        /// <summary>
         /// Initializes static members of the <see cref="StorageRestClient"/> class.
         /// </summary>
         static StorageRestClient()
@@ -34,7 +44,20 @@
         /// <summary>
         /// Gets or sets the account name.
         /// </summary>
-        public static string AccountName { get; set; }
+        public static string AccountName
+        {
+            get
+            {
+                return accountName;
+            }
+
+            set
+            {
+                accountName = value;
+
+                baseAddress = new Uri(accountName == "devstoreaccount1" ? "http://localhost:10000/devstoreaccount1/" : string.Format("https://{0}.blob.core.windows.net/", accountName));
+            }
+        }
 
         /// <summary>
         /// Gets or sets the account key.
@@ -71,7 +94,7 @@
 
             using (var client = new HttpClient())
             {
-                client.BaseAddress = new Uri(string.Format("https://{0}.blob.core.windows.net/", AccountName));
+                client.BaseAddress = baseAddress;
 
                 foreach (var header in headers)
                 {
@@ -82,9 +105,9 @@
                 {
                     if (content != null)
                     {
-                        using (var streamContent = new StreamContent(content.Item2))
+                        using (var stream = new StreamContent(content.Item2))
                         {
-                            request.Content = streamContent;
+                            request.Content = stream;
                             if (!string.IsNullOrEmpty(content.Item1))
                             {
                                 request.Content.Headers.ContentType = new MediaTypeHeaderValue(content.Item1);
@@ -117,16 +140,12 @@
         private static void SetAzureRequestHeader(IDictionary<string, string> requestHeaders, string httpMethod, string address, long contentLength)
         {
             requestHeaders["x-ms-date"] = DateTime.UtcNow.ToString("R");
+            requestHeaders["x-ms-blob-type"] = "BlockBlob";
             requestHeaders["x-ms-version"] = Version;
-
-            if (AccountKey == "UseDevelopmentStorage=true")
-            {
-                return;
-            }
 
             var canonicalizedHeaders = string.Join("\n", requestHeaders.OrderBy(k => k.Key).Select(p => string.Format(CultureInfo.InvariantCulture, "{0}:{1}", p.Key.ToLower(), p.Value)).ToArray());
 
-            var uri = new Uri(new Uri(string.Format("https://{0}.blob.core.windows.net/", AccountName)), address);
+            var uri = new Uri(baseAddress, address);
             var canonicalizedResource = string.Format(CultureInfo.InvariantCulture, "/{0}{1}", AccountName, uri.AbsolutePath);
             var queryStringValues = HttpUtility.ParseQueryString(uri.Query);
             if (queryStringValues.Count > 0)

@@ -10,6 +10,7 @@ namespace Lucene.Net.Store.Azure
     using System.Linq;
     using System.Net;
     using System.Net.Http;
+    using System.Text;
 
     /// <summary>
     /// Implements lock semantics on AzureDirectory via a blob lease
@@ -233,7 +234,7 @@ namespace Lucene.Net.Store.Azure
                 null,
                 response =>
                 {
-                    if (response.IsSuccessStatusCode)
+                    if (!response.IsSuccessStatusCode)
                     {
                         throw new Exception("Failed to release the blob lease.");
                     }
@@ -323,11 +324,8 @@ namespace Lucene.Net.Store.Azure
 
             this.azureDirectory.CreateContainer();
 
-            using (var stream = new MemoryStream())
-            using (var writer = new StreamWriter(stream))
+            using (var stream = new MemoryStream(Encoding.UTF8.GetBytes(this.lockFile)))
             {
-                writer.Write(this.lockFile);
-
                 StorageRestClient.Run(
                     HttpMethod.Put,
                     string.Format(CultureInfo.InvariantCulture, "{0}/{1}", this.azureDirectory.ContainerName, this.lockFile),

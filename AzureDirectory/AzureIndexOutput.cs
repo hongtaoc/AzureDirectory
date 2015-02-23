@@ -165,6 +165,8 @@ namespace Lucene.Net.Store.Azure
 
                 try
                 {
+                    var streamLength = blobStream.Length;
+
                     // push the blobStream up to the cloud
                     StorageRestClient.Run(
                         HttpMethod.Put,
@@ -197,7 +199,7 @@ namespace Lucene.Net.Store.Azure
                             }
                         }).Wait();
 
-                    Debug.WriteLine("PUT {1} bytes to {0} in cloud", this.blob, blobStream.Length);
+                    Debug.WriteLine("PUT {1} bytes to {0} in cloud", this.blob, streamLength);
                 }
                 finally
                 {

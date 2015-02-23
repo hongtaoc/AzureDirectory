@@ -19,7 +19,7 @@ namespace TestApp
         {
             
             // default AzureDirectory stores cache in local temp folder
-            var azureDirectory = new AzureDirectory(CloudStorageAccount.Parse(ConfigurationManager.AppSettings["blobStorage"]), "TestCatalog6");
+            var azureDirectory = new AzureDirectory(ConfigurationManager.AppSettings["accountName"], ConfigurationManager.AppSettings["accountKey"], "TestCatalog6");
             var findexExists = IndexReader.IndexExists(azureDirectory);
 
             IndexWriter indexWriter = null;

@@ -37,7 +37,7 @@ namespace Lucene.Net.Store.Azure
             Directory cacheDirectory = null,
             string rootFolder = null)
         {
-            if (string.IsNullOrEmpty(accountName))
+            if (string.IsNullOrEmpty(accountName) || string.IsNullOrEmpty(accountKey))
             {
                 throw new ArgumentNullException("accountName");
             }
@@ -207,7 +207,7 @@ namespace Lucene.Net.Store.Azure
                 null,
                 response =>
                 {
-                    if (!response.IsSuccessStatusCode)
+                    if (!response.IsSuccessStatusCode && response.StatusCode != HttpStatusCode.NotFound)
                     {
                         throw new Exception("Failed to delete a blob.");
                     }
@@ -283,9 +283,7 @@ namespace Lucene.Net.Store.Azure
         {
             try
             {
-                var blob = _blobContainer.GetBlockBlobReference(RootFolder + name);
-                blob.FetchAttributes();
-                return new AzureIndexInput(this, blob);
+                return new AzureIndexInput(this, this.RootFolder + name);
             }
             catch (Exception err)
             {
